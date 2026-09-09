@@ -1,0 +1,25 @@
+services:
+  mongooseim:
+    image: erlangsolutions/mongooseim:latest
+    container_name: mongooseim
+    hostname: mongooseim-1
+    restart: unless-stopped
+    environment:
+      NODE_NAME: mongooseim
+      NODE_TYPE: sname
+      JOIN_CLUSTER: "false"
+      PRINT_CONFIG_FILES_ON_START: "false"
+    ports:
+      - "5222:5222"   # c2s (client XMPP)
+      - "5269:5269"   # s2s (server-to-server federation)
+      - "5280:5280"   # HTTP (BOSH / WebSocket)
+      - "5285:5285"   # HTTPS (BOSH / WebSocket)
+      - "4369:4369"   # epmd
+    volumes:
+      - ./conf:/member
+      - mongooseim_data:/var/lib/mongooseim
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  mongooseim_data:

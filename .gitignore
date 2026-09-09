@@ -1,0 +1,5 @@
+.DS_Store
+
+# Local dev secrets — see test-credentials.md's own header
+test-credentials.md
+xmpp/test-accounts.js

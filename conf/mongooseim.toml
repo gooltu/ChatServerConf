@@ -1,0 +1,305 @@
+[general]
+  loglevel = "warning"
+  hosts = ["jewelchat.net"]
+  host_types = []
+  default_server_domain = "jewelchat.net"
+  registration_timeout = "infinity"
+  language = "en"
+
+[[listen.http]]
+  port = 5280
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+
+  [[listen.http.handlers.mongoose_bosh_handler]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mongoose_websocket_handler]]
+    host = "_"
+    path = "/ws-xmpp"
+    # Default idle timeout is 60s (cowboy closes the socket if it sees no
+    # frames for that long) — too short for manual testing where you sit
+    # reading the log or filling in a form. 10 minutes is more forgiving;
+    # the xmpp/ test console also sends its own keepalive ping every 30s
+    # as a second line of defense.
+    timeout = 600_000
+
+[[listen.http]]
+  port = 5285
+  transport.num_acceptors = 10
+  transport.max_connections = 1024
+  tls.verify_mode = "none"
+  tls.certfile = "priv/ssl/fake_cert.pem"
+  tls.keyfile = "priv/ssl/fake_key.pem"
+
+  [[listen.http.handlers.mongoose_bosh_handler]]
+    host = "_"
+    path = "/http-bind"
+
+  [[listen.http.handlers.mongoose_websocket_handler]]
+    host = "_"
+    path = "/ws-xmpp"
+    # Default idle timeout is 60s (cowboy closes the socket if it sees no
+    # frames for that long) — too short for manual testing where you sit
+    # reading the log or filling in a form. 10 minutes is more forgiving;
+    # the xmpp/ test console also sends its own keepalive ping every 30s
+    # as a second line of defense.
+    timeout = 600_000
+
+[[listen.c2s]]
+  port = 5222
+  access = "c2s"
+  shaper = "normal"
+  max_stanza_size = 65536
+  tls.verify_mode = "none"
+  tls.certfile = "priv/ssl/fake_cert.pem"
+  tls.keyfile = "priv/ssl/fake_key.pem"
+
+[[listen.s2s]]
+  port = 5269
+  shaper = "fast"
+  max_stanza_size = 131072
+  tls.verify_mode = "none"
+  tls.certfile = "priv/ssl/fake_cert.pem"
+  tls.keyfile = "priv/ssl/fake_key.pem"
+
+[[listen.component]]
+  port = 8888
+  access = "all"
+  shaper = "fast"
+  ip_address = "127.0.0.1"
+  password = "secret"
+
+[auth]
+  methods = ["http"]
+
+  [auth.http]
+
+  # Force plain password auth: the http backend only implements plaintext
+  # check_password, but MongooseIM defaults to SCRAM (format = "scram"),
+  # which calls get_password instead and tries to parse the response as
+  # SCRAM-serialized data — that path can never succeed against this backend.
+  [auth.password]
+    format = "plain"
+
+[internal_databases.mnesia]
+
+# Backend database for MongooseIM (accounts/MAM/etc. can be pointed at this
+# pool once you enable the relevant rdbms-backed modules).
+# The container reaches the host's `mysql-db` container through its published
+# port via host.docker.internal, so no extra docker network wiring is needed.
+[outgoing_pools.rdbms.default]
+  scope = "global"
+  workers = 5
+
+  [outgoing_pools.rdbms.default.connection]
+    driver = "mysql"
+    host = "host.docker.internal"
+    port = 3306
+    database = "mongooseim"
+    username = "mongooseim"
+    password = "C1hgqgbRuVUjTRiEji2PUvmQ"
+
+# HTTP auth backend: MongooseIM calls out to this service for
+# check_password / user_exists / get_password / register / set_password /
+# remove_user. The container reaches the host's `serverprojectx` container
+# (localhost:3000) via host.docker.internal, same as the MySQL pool above.
+[outgoing_pools.http.auth]
+  scope = "global"
+  workers = 10
+
+  [outgoing_pools.http.auth.connection]
+    host = "http://host.docker.internal:3000"
+    path_prefix = "/mongooseim/"
+    request_timeout = 2000
+
+[services.service_bosh]
+
+[services.service_mongoose_system_metrics]
+
+[modules.mod_adhoc]
+
+[modules.mod_disco]
+  users_can_see_hidden_services = false
+
+[modules.mod_stream_management]
+
+[modules.mod_register]
+  ip_access = [
+    {address = "127.0.0.0/8", policy = "allow"},
+    {address = "0.0.0.0/0", policy = "deny"}
+  ]
+  access = "register"
+
+[modules.mod_presence]
+
+# Roster (contact list) management — handles jabber:iq:roster IQs (add/
+# remove/query contacts, subscription state). backend = "rdbms" matches the
+# rosterusers / rostergroups / roster_version tables already loaded into
+# MySQL, instead of the module's mnesia default. Versioning (XEP-0237) left
+# off — the xmpp/ test console doesn't implement it, so there's nothing to
+# exercise it right now.
+[modules.mod_roster]
+  backend = "rdbms"
+
+[modules.mod_sic]
+
+[modules.mod_time]
+
+[modules.mod_vcard]
+  host = "vjud.@HOST@"
+
+[modules.mod_carboncopy]
+
+# Signing keys for mod_auth_token. "token_secret" is the fixed key name
+# mod_auth_token looks up for both access and refresh tokens. "ram" keys are
+# generated in memory and regenerate on every restart (fine for dev; use
+# type = "file" if issued tokens need to survive a restart).
+[modules.mod_keystore]
+  ram_key_size = 32
+  keys = [
+    {name = "token_secret", type = "ram"}
+  ]
+
+# Token-based auth. backend defaults to "rdbms", which matches the
+# auth_token table already present in the MySQL schema loaded earlier.
+[modules.mod_auth_token]
+  validity_period.access = {value = 5, unit = "minutes"}
+  validity_period.refresh = {value = 5, unit = "minutes"}
+
+# Message Archive Management. backend = "rdbms" matches the mam_message /
+# mam_muc_message / mam_config / mam_server_user tables already loaded into
+# MySQL. full_text_search is off because that schema has no FULLTEXT index
+# on the search_body columns, so MAM text-search queries would error against
+# it if left on (message storage/retrieval itself is unaffected either way).
+# [modules.mod_mam.muc].host is set to mod_muc_light's own subdomain
+# (muclight.@HOST@) rather than mod_mam's default, which targets the
+# classic mod_muc subdomain instead — since only mod_muc_light is enabled
+# here, MAM's MUC archive-query IQ handler must be registered on the
+# subdomain mod_muc_light actually uses, or group-chat archive queries would
+# be routed nowhere.
+[modules.mod_mam]
+  backend = "rdbms"
+  full_text_search = false
+
+  [modules.mod_mam.pm]
+
+  [modules.mod_mam.muc]
+    host = "muclight.@HOST@"
+
+# Lightweight MUC (group chat). backend = "rdbms" matches the muc_light_rooms
+# / muc_light_config / muc_light_occupants / muc_light_blocking tables
+# already loaded into MySQL, instead of the module's mnesia default.
+# allow_multiple_owners: test accounts are peers, not a fixed admin, so any
+# owner can promote another occupant to co-owner instead of there being a
+# single privileged creator.
+# Note: promote_on_last_owner_leave (mentioned in the module docs) is NOT a
+# recognized config key in this MongooseIM version (6.6.0) — the running
+# node's own config_spec error confirmed the accepted key set, and this
+# wasn't in it. Left out; if the last owner leaves with members still
+# present, whatever this version's built-in (non-configurable) behavior is
+# will apply.
+[modules.mod_muc_light]
+  backend = "rdbms"
+  allow_multiple_owners = true
+
+[instrumentation.prometheus]
+
+[instrumentation.log]
+
+[shaper.normal]
+  max_rate = 16_384
+
+[shaper.fast]
+  max_rate = 50_000
+
+[shaper.mam_shaper]
+  max_rate = 1
+
+[shaper.mam_global_shaper]
+  max_rate = 1000
+
+[acl]
+  local = [{}]
+
+[access]
+  max_user_sessions = [
+    {acl = "all", value = 10}
+  ]
+
+  max_user_offline_messages = [
+    {acl = "admin", value = 5000},
+    {acl = "all", value = 100}
+  ]
+
+  local = [
+    {acl = "local", value = "allow"}
+  ]
+
+  c2s = [
+    {acl = "blocked", value = "deny"},
+    {acl = "all", value = "allow"}
+  ]
+
+  muc_admin = [
+    {acl = "admin", value = "allow"}
+  ]
+
+  muc_create = [
+    {acl = "local", value = "allow"}
+  ]
+
+  muc = [
+    {acl = "all", value = "allow"}
+  ]
+
+  register = [
+    {acl = "all", value = "allow"}
+  ]
+
+  mam_set_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_get_prefs = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_lookup_messages = [
+    {acl = "all", value = "default"}
+  ]
+
+  mam_set_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_get_prefs_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_lookup_messages_shaper = [
+    {acl = "all", value = "mam_shaper"}
+  ]
+
+  mam_set_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_get_prefs_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+  mam_lookup_messages_global_shaper = [
+    {acl = "all", value = "mam_global_shaper"}
+  ]
+
+[s2s]
+  default_policy = "deny"
+
+  [s2s.outgoing]
+    port = 5269
+    tls.mode = "starttls"
+    tls.verify_mode = "none"
+    tls.certfile = "priv/ssl/fake_cert.pem"
+    tls.keyfile = "priv/ssl/fake_key.pem"

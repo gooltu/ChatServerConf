@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MongooseIM WebSocket Console</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <h1>MongooseIM WebSocket Console</h1>
+    <p class="subtitle">Strophe.js client &middot; logs every XML stanza sent and received</p>
+  </header>
+
+  <main>
+    <datalist id="contacts-datalist"></datalist>
+
+    <div class="sidebar">
+      <section class="panel connection-panel">
+        <h2>Connection</h2>
+        <form id="connect-form">
+          <label>
+            Saved test account
+            <select id="test-account-select">
+              <option value="">— select —</option>
+            </select>
+          </label>
+          <label>
+            WebSocket URL
+            <input id="ws-url" type="text" value="ws://localhost:5280/ws-xmpp" required>
+          </label>
+          <label>
+            JID
+            <input id="jid" type="text" placeholder="user@jewelchat.net" autocomplete="username" required>
+          </label>
+          <label>
+            Password
+            <input id="password" type="password" autocomplete="current-password" required>
+          </label>
+          <div class="actions">
+            <button id="connect-btn" type="submit">Connect</button>
+            <button id="disconnect-btn" type="button" disabled>Disconnect</button>
+          </div>
+        </form>
+
+        <div class="status">
+          <span id="status-dot" class="dot disconnected"></span>
+          <span id="status-text">Disconnected</span>
+        </div>
+
+        <div class="actions post-connect-actions">
+          <button id="request-tokens-btn" type="button" disabled>Request Auth Tokens</button>
+          <button id="server-time-btn" type="button" disabled>Get Server Time</button>
+        </div>
+      </section>
+
+      <section class="panel actions-panel">
+        <h2>Actions</h2>
+
+        <div class="action-group">
+          <h3>Roster</h3>
+          <label>
+            Contact JID
+            <input id="roster-jid" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+          </label>
+          <label>
+            Name (optional)
+            <input id="roster-name" type="text" placeholder="Friend">
+          </label>
+          <button id="add-roster-btn" type="button" disabled>Add to Roster</button>
+        </div>
+
+        <div class="action-group">
+          <h3>Presence</h3>
+          <label>
+            Type
+            <select id="presence-type">
+              <option value="">available</option>
+              <option value="unavailable">unavailable</option>
+              <option value="subscribe">subscribe</option>
+              <option value="subscribed">subscribed</option>
+              <option value="unsubscribe">unsubscribe</option>
+              <option value="unsubscribed">unsubscribed</option>
+            </select>
+          </label>
+          <label>
+            To (optional — blank broadcasts to all)
+            <input id="presence-to" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+          </label>
+          <label>
+            Status text (optional)
+            <input id="presence-status" type="text" placeholder="Available">
+          </label>
+          <button id="send-presence-btn" type="button" disabled>Send Presence</button>
+        </div>
+
+        <div class="action-group">
+          <h3>Message</h3>
+          <label>
+            To JID
+            <input id="message-to" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+          </label>
+          <label>
+            Body
+            <input id="message-body" type="text" placeholder="Hello!">
+          </label>
+          <label>
+            Message ID (optional — auto-generated if blank)
+            <input id="message-id" type="text" placeholder="msg1">
+          </label>
+          <label class="checkbox-label">
+            <input id="request-receipt-checkbox" type="checkbox">
+            Request delivery receipt
+          </label>
+          <button id="send-message-btn" type="button" disabled>Send Message</button>
+
+          <label>
+            Ack message ID
+            <input id="ack-message-id" type="text" placeholder="msg1">
+          </label>
+          <div class="actions">
+            <button id="send-delivery-receipt-btn" type="button" disabled>Send Delivery Receipt</button>
+            <button id="send-read-receipt-btn" type="button" disabled>Send Read Receipt</button>
+          </div>
+        </div>
+      </section>
+    </div>
+
+    <section class="panel log-panel">
+      <div class="log-header">
+        <h2>Stanza Log</h2>
+        <button id="clear-log-btn" type="button">Clear</button>
+      </div>
+      <div id="log" class="log" aria-live="polite"></div>
+    </section>
+
+    <section class="panel muc-panel">
+      <h2>Group Chat</h2>
+
+      <div class="active-room">
+        <label>
+          Active Room
+          <select id="muc-room-select">
+            <option value="">— none —</option>
+          </select>
+        </label>
+        <button id="muc-refresh-rooms-btn" type="button" disabled>Refresh Rooms</button>
+      </div>
+
+      <div class="action-group">
+        <h3>Create Room</h3>
+        <label>
+          Room name
+          <input id="muc-create-name" type="text" placeholder="Book Club">
+        </label>
+        <label>
+          Room ID (optional — auto-generated if blank)
+          <input id="muc-create-room-id" type="text" placeholder="book-club">
+        </label>
+        <label>
+          Add occupant
+          <input id="muc-create-occupant-jid" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+        </label>
+        <button id="muc-create-add-occupant-btn" type="button">Add Occupant</button>
+        <ul id="muc-create-occupant-list" class="chip-list"></ul>
+        <button id="muc-create-room-btn" type="button" disabled>Create Room</button>
+      </div>
+
+      <div class="action-group">
+        <h3>Rename Room</h3>
+        <label>
+          New room name
+          <input id="muc-rename-input" type="text" placeholder="New name">
+        </label>
+        <button id="muc-rename-btn" type="button" disabled>Rename Room</button>
+      </div>
+
+      <div class="action-group">
+        <h3>Manage Members</h3>
+        <label>
+          Member JID
+          <input id="muc-affiliation-jid" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+        </label>
+        <label>
+          Affiliation
+          <select id="muc-affiliation-select">
+            <option value="member">member</option>
+            <option value="owner">owner</option>
+            <option value="none">none (remove)</option>
+          </select>
+        </label>
+        <button id="muc-affiliation-btn" type="button" disabled>Apply</button>
+      </div>
+
+      <div class="action-group">
+        <h3>Room Info</h3>
+        <div class="actions">
+          <button id="muc-get-config-btn" type="button" disabled>Get Config</button>
+          <button id="muc-get-affiliations-btn" type="button" disabled>Get Members</button>
+        </div>
+      </div>
+
+      <div class="action-group">
+        <h3>Group Message</h3>
+        <label>
+          Body
+          <input id="muc-message-body" type="text" placeholder="Hello, room!">
+        </label>
+        <button id="muc-send-message-btn" type="button" disabled>Send Group Message</button>
+      </div>
+
+      <div class="action-group">
+        <h3>Blocking</h3>
+        <label>
+          Target type
+          <select id="muc-block-target-type">
+            <option value="room">Room (active room)</option>
+            <option value="user">User</option>
+          </select>
+        </label>
+        <label>
+          User JID (when target type is User)
+          <input id="muc-block-jid" type="text" list="contacts-datalist" placeholder="friend@jewelchat.net">
+        </label>
+        <label>
+          Action
+          <select id="muc-block-action">
+            <option value="deny">Block</option>
+            <option value="allow">Unblock</option>
+          </select>
+        </label>
+        <div class="actions">
+          <button id="muc-block-apply-btn" type="button" disabled>Apply</button>
+          <button id="muc-get-blocklist-btn" type="button" disabled>Get Block List</button>
+        </div>
+      </div>
+
+      <div class="action-group">
+        <h3>Destroy Room</h3>
+        <button id="muc-destroy-room-btn" type="button" disabled>Destroy Room</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/strophe.js@4.1.2/dist/strophe.umd.min.js"></script>
+  <script src="test-accounts.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
