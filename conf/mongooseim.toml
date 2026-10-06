@@ -147,6 +147,12 @@
 
 [modules.mod_time]
 
+# XEP-0199 Ping — without this, <iq><ping xmlns='urn:xmpp:ping'/></iq> gets
+# service-unavailable (no handler registered for the namespace) instead of
+# a proper result. The xmpp/ test console's 30s keepalive relies on this
+# for a real pong, not just raw socket traffic.
+[modules.mod_ping]
+
 [modules.mod_vcard]
   host = "vjud.@HOST@"
 

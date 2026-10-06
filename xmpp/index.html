@@ -112,6 +112,10 @@
             <input id="request-receipt-checkbox" type="checkbox">
             Request delivery receipt
           </label>
+          <label class="checkbox-label">
+            <input id="chat-state-checkbox" type="checkbox" checked>
+            Include chat state ("active")
+          </label>
           <button id="send-message-btn" type="button" disabled>Send Message</button>
 
           <label>
@@ -205,6 +209,10 @@
         <label>
           Body
           <input id="muc-message-body" type="text" placeholder="Hello, room!">
+        </label>
+        <label>
+          Message ID (optional — auto-generated if blank)
+          <input id="muc-message-id" type="text" placeholder="msg1">
         </label>
         <button id="muc-send-message-btn" type="button" disabled>Send Group Message</button>
       </div>

@@ -26,6 +26,7 @@
   const messageBodyInput = document.getElementById('message-body');
   const messageIdInput = document.getElementById('message-id');
   const requestReceiptCheckbox = document.getElementById('request-receipt-checkbox');
+  const chatStateCheckbox = document.getElementById('chat-state-checkbox');
   const sendMessageBtn = document.getElementById('send-message-btn');
   const ackMessageIdInput = document.getElementById('ack-message-id');
   const sendDeliveryReceiptBtn = document.getElementById('send-delivery-receipt-btn');
@@ -54,6 +55,7 @@
   const mucGetAffiliationsBtn = document.getElementById('muc-get-affiliations-btn');
 
   const mucMessageBodyInput = document.getElementById('muc-message-body');
+  const mucMessageIdInput = document.getElementById('muc-message-id');
   const mucSendMessageBtn = document.getElementById('muc-send-message-btn');
 
   const mucBlockTargetTypeSelect = document.getElementById('muc-block-target-type');
@@ -202,6 +204,11 @@
     });
   }
 
+  // ids of in-flight keepalive pings, so their (otherwise indistinguishable
+  // from any other empty IQ result) pong replies can be filtered out of the
+  // log alongside the ping itself.
+  const pendingPingIds = new Set();
+
   function startKeepAlive() {
     stopKeepAlive();
     keepAliveTimer = setInterval(() => {
@@ -209,7 +216,9 @@
       // XEP-0199 ping to the server itself. The websocket handler's idle
       // timeout closes the socket after a period with no frames at all —
       // this keeps it alive during long pauses between manual test actions.
-      connection.send($iq({ type: 'get' }).c('ping', { xmlns: 'urn:xmpp:ping' }));
+      const id = connection.getUniqueId('ping');
+      pendingPingIds.add(id);
+      connection.send($iq({ type: 'get', id }).c('ping', { xmlns: 'urn:xmpp:ping' }));
     }, KEEPALIVE_INTERVAL_MS);
   }
 
@@ -359,8 +368,15 @@
     // restrict SASL to PLAIN — otherwise Strophe defaults to SCRAM-SHA-512,
     // which that backend can't satisfy.
     connection = new Strophe.Connection(service, { mechanisms: [Strophe.SASLPlain] });
-    connection.rawInput = (data) => logStanza('recv', data);
-    connection.rawOutput = (data) => logStanza('sent', data);
+    connection.rawInput = (data) => {
+      const idMatch = data.match(/\sid=["']([^"']+)["']/);
+      if (idMatch && pendingPingIds.delete(idMatch[1])) return;
+      logStanza('recv', data);
+    };
+    connection.rawOutput = (data) => {
+      if (data.includes('urn:xmpp:ping')) return;
+      logStanza('sent', data);
+    };
 
     setStatus(Strophe.Status.CONNECTING);
     console.log(password)
@@ -472,7 +488,8 @@
     const body = mucMessageBodyInput.value.trim();
     if (!connection || !to || !body) return;
 
-    const msg = $msg({ to, type: 'groupchat' }).c('body').t(body);
+    const id = mucMessageIdInput.value.trim() || connection.getUniqueId('muc-msg');
+    const msg = $msg({ to, type: 'groupchat', id, msgtype: '0' }).c('body').t(body);
     connection.send(msg);
     mucMessageBodyInput.value = '';
   });
@@ -543,9 +560,12 @@
     if (!to || !body) return;
 
     const id = messageIdInput.value.trim() || connection.getUniqueId('msg');
-    const msg = $msg({ to, type: 'chat', id }).c('body').t(body);
-    if (requestReceiptCheckbox.checked) {
-      msg.up().c('request', { xmlns: 'urn:xmpp:receipts' });
+    const msg = $msg({ to, type: 'chat', id, msgtype: '0' }).c('body').t(body).up();
+    if (requestReceiptCheckbox?.checked) {
+      msg.c('request', { xmlns: 'urn:xmpp:receipts' }).up();
+    }
+    if (chatStateCheckbox?.checked) {
+      msg.c('active', { xmlns: 'http://jabber.org/protocol/chatstates' }).up();
     }
     connection.send(msg);
     messageBodyInput.value = '';

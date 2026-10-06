@@ -3,3 +3,13 @@
 # Local dev secrets — see test-credentials.md's own header
 test-credentials.md
 xmpp/test-accounts.js
+
+# Terraform — local provider cache/state; real state lives in the S3
+# backends configured in infra/*/providers.tf, never committed here
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfvars
+crash.log
+override.tf
+override.tf.json

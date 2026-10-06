@@ -406,3 +406,94 @@ user/password pair — `A.10`'s identical-shape credential still returned
 `check_password` curl (already documented above under "HTTP auth backend")
 is the fastest way to tell "my config broke" from "the backend's opinion of
 this credential changed under me" before chasing the wrong layer.
+
+## Production AWS infrastructure (`infra/`)
+
+Terraform under `infra/` provisions a real production deployment of this
+same stack — MongooseIM + the Node.js app ("ServerProjextX") each on their
+own EC2 Auto Scaling Group, behind one AWS ALB, MySQL migrated to RDS.
+Region `ap-south-2`, domain `jewelchat.net`. Code has been written and
+`terraform validate`-checked; **nothing has been applied yet** — see
+`infra/BOOTSTRAP.md` for the required one-time manual setup before any
+`terraform apply` can run.
+
+- **Two Terraform states, two IAM identities, deliberately separated**:
+  `infra/iam/` (run under the `iam-admin` AWS CLI profile) owns IAM only —
+  it creates the two EC2 runtime roles and can never touch EC2/RDS/ALB.
+  `infra/app/` (run under `infra-provisioner`) owns all the actual
+  infrastructure and can never create/modify IAM — it only gets
+  `iam:PassRole`, scoped to exactly the two role ARNs `iam-admin` created.
+  `infra/app/asg_*.tf` reference those roles via `data
+  "aws_iam_instance_profile"` lookups, never `resource` blocks — this is
+  what keeps the separation real rather than just stated.
+  Every role `iam-admin` creates is forced (via an `iam:PermissionsBoundary`
+  condition in `iam-admin`'s own policy) to carry a boundary policy
+  (`AppRuntimeBoundary`) that only root can edit — without this, IAM-create
+  permissions alone would let `iam-admin` mint itself a new, more powerful
+  identity and route around the whole split.
+- **Why this got complicated**: the first design used self-managed NGINX
+  instead of an ALB. That meant no free target-group registration when an
+  ASG replaces an instance, so NGINX would need Route53 self-registration +
+  DNS-based upstream resolution just to not proxy to dead IPs, plus
+  Certbot for TLS (ACM only attaches to ALB/CloudFront, not a bare EC2).
+  Switched to ALB specifically to avoid building and operating that — ALB
+  gets WebSocket support, target-group registration, TLS via ACM, and
+  sticky sessions all for free. Worth remembering if NGINX ever comes back
+  up as an option: that whole service-discovery problem is the real cost
+  of choosing it over ALB.
+- **MongooseIM starts at one instance but is built for Mnesia clustering
+  from day one** (`infra/app/asg_mongooseim.tf`, user-data in
+  `infra/app/userdata/mongooseim.sh.tpl`) — the user explicitly wants to
+  add nodes as load grows without a later redesign. Mechanism: a shared
+  Erlang cookie in Secrets Manager (`mongooseim/erlang-cookie`, generated
+  once in `BOOTSTRAP.md`, never in Terraform state); each instance sets
+  `-name mongooseim@<its own private IP>` and `-setcookie <fetched
+  cookie>` in a templated `vm.args` at boot; peer discovery queries
+  `autoscaling:DescribeAutoScalingGroups`/`ec2:DescribeInstances` for other
+  `InService` members of `mongooseim-asg` and runs `mongooseimctl mnesia
+  join_cluster` against one of them (empty peer list = seed node, nothing
+  to join). This reuses read-only EC2/ASG describe permissions rather than
+  reintroducing the Route53 self-registration machinery dropped along with
+  NGINX. **Known sharp edge, not yet solved in code**: simultaneous joins
+  race — when actually raising `desired_capacity` above 1, do it one
+  instance at a time. RDS-backed data (roster/MAM/muc_light/auth_token) is
+  already shared across nodes regardless of clustering; clustering only
+  makes Mnesia's internal session/routing table consistent, which is what
+  makes it safe for the ALB to send different clients to different nodes.
+- **MongooseIM's `auth.http` → Node app call, in production**: points at
+  the ALB's own DNS name with `path_prefix = "/mongooseim/"`
+  (`mongooseim.sh.tpl`), not at `host.docker.internal` like dev. Traffic
+  stays inside the VPC since the call never leaves AWS's network; this
+  reuses the ALB as the one stable address instead of inventing a second
+  internal discovery mechanism. `nodeapp-sg` has an explicit inbound rule
+  from `mongooseim-sg` on port 3000 for this.
+- **Node app tier deploys from ECR, not git+build-on-boot**
+  (`infra/app/ecr.tf`, `userdata/nodeapp.sh.tpl`) — building from source at
+  boot would need git credentials for the private ServerProjextX repo as
+  yet another secret, and is slow/fragile to do on every instance launch.
+  `nodeapp-runtime-role` gets pull-only ECR access to exactly the
+  `serverprojectx` repo. **Pushing the image to ECR is a separate deploy
+  step this Terraform doesn't do** — expected to happen from the other
+  Claude Code session that owns ServerProjextX's own code.
+- **Secrets layout**: `mongooseim/db-credentials`, `mongooseim/erlang-cookie`,
+  `serverprojectx/db-credentials`, `serverprojectx/app-secrets` (the latter
+  holds everything else `ServerProjextX/.env` needs — Firebase fields,
+  legacy `topicname`/`memcached`/`gcmkey` — as one JSON blob the user-data
+  script flattens into `.env` key-by-key, so adding a field later doesn't
+  mean touching the script). The `mongooseim`/`serverprojectx` *app-level*
+  DB users (as opposed to the RDS master user, which is AWS-managed via
+  `manage_master_user_password`) get created manually during the RDS
+  bootstrap step in `BOOTSTRAP.md`/plan, at the same time their credentials
+  go into the two `*/db-credentials` secrets.
+- **RDS**: one `db.t3.micro`, single-AZ, hosting both the `mongooseim` and
+  `gameserver` databases — matches the current single `mysql-db` container
+  exactly, not split into two instances. No public access; reached only via
+  SSM Session Manager port-forwarding for the one-time schema bootstrap
+  (loading this repo's own `db/mysql-schema.sql`), never a bastion host or
+  an internet-facing endpoint.
+- Full design rationale, the exact IAM policy JSON, and the verification
+  checklist live in the plan file this was built from
+  (`~/.claude/plans/recursive-meandering-newell.md` as of this writing) —
+  worth reading before changing the IAM split or the clustering mechanism,
+  since both went through several rounds of deliberate tradeoff discussion
+  (NGINX vs ALB, one IAM identity vs two, single vs clustered MongooseIM).
