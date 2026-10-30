@@ -11,7 +11,14 @@ resource "aws_launch_template" "nodeapp" {
     name = data.aws_iam_instance_profile.nodeapp.name
   }
 
-  vpc_security_group_ids = [aws_security_group.nodeapp.id]
+  # Public subnet + public IP now (NAT removed, see vpc.tf) — security_groups
+  # must live inside network_interfaces once associate_public_ip_address is
+  # set here; the AWS provider rejects mixing this with a top-level
+  # vpc_security_group_ids on the same launch template.
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.nodeapp.id]
+  }
 
   user_data = base64encode(templatefile("${path.module}/userdata/nodeapp.sh.tpl", {
     region             = var.aws_region
@@ -28,7 +35,7 @@ resource "aws_launch_template" "nodeapp" {
 
 resource "aws_autoscaling_group" "nodeapp" {
   name                = "nodeapp-asg"
-  vpc_zone_identifier = aws_subnet.private[*].id
+  vpc_zone_identifier = aws_subnet.public[*].id
 
   # Fixed at nodeapp_desired_capacity for now (no scaling policy yet) —
   # real horizontal scaling, unlike MongooseIM's tier. Adjust manually as

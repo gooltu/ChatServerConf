@@ -27,7 +27,14 @@ resource "aws_launch_template" "mongooseim" {
     name = data.aws_iam_instance_profile.mongooseim.name
   }
 
-  vpc_security_group_ids = [aws_security_group.mongooseim.id]
+  # Public subnet + public IP now (NAT removed, see vpc.tf) — security_groups
+  # must live inside network_interfaces once associate_public_ip_address is
+  # set here; the AWS provider rejects mixing this with a top-level
+  # vpc_security_group_ids on the same launch template.
+  network_interfaces {
+    associate_public_ip_address = true
+    security_groups             = [aws_security_group.mongooseim.id]
+  }
 
   user_data = base64encode(templatefile("${path.module}/userdata/mongooseim.sh.tpl", {
     region         = var.aws_region
@@ -44,15 +51,17 @@ resource "aws_launch_template" "mongooseim" {
 
 resource "aws_autoscaling_group" "mongooseim" {
   name                = local.mongooseim_asg_name
-  vpc_zone_identifier = aws_subnet.private[*].id
+  vpc_zone_identifier = aws_subnet.public[*].id
 
-  # Starts at 1 (self-healing), built for clustering from day one — raise
-  # desired_capacity one instance at a time when load grows (plan §5
-  # race-avoidance caveat). max gives room to grow without touching this
-  # resource again.
-  min_size         = 1
+  # Intended steady state is 1 (self-healing), built for clustering from
+  # day one — raise desired_capacity one instance at a time when load grows
+  # (plan §5 race-avoidance caveat). Variable (not hardcoded 1, matching
+  # nodeapp's pattern) so this ASG can be deliberately idled at 0 — e.g.
+  # between infra changes, before MongooseIM is actually ready to launch —
+  # without editing this file; default is the intended steady state.
+  min_size         = var.mongooseim_desired_capacity
   max_size         = var.mongooseim_max_capacity
-  desired_capacity = 1
+  desired_capacity = var.mongooseim_desired_capacity
 
   launch_template {
     id      = aws_launch_template.mongooseim.id

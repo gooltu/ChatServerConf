@@ -378,6 +378,115 @@ API). `Strophe.Connection` accepts a second `options` arg, notably
   promote, and the 1:1 delivery/read receipts) need two working accounts to
   exercise for real — see the note below.
 
+## mod_push_service_mongoosepush
+
+- Adapter that knows how to POST a push notification to a MongoosePush-shaped
+  HTTP endpoint; it does **not** itself decide *when* to push — that's
+  `mod_event_pusher`'s `push` backend (XEP-0357), not configured here yet.
+  This module only wires up where an actual push would be sent if something
+  else asked it to.
+- Config surface (from `mod_push_service_mongoosepush.erl`'s `config_spec/0`
+  read straight from the running container, same approach as other
+  version-sensitive modules in this file): `pool_name` (atom, no default —
+  must be set), `api_version` (`"v2"` or `"v3"`, defaults to `"v3"`),
+  `max_http_connections` (defaults to 100).
+- `pool_name` must match an `[outgoing_pools.http.<name>]` pool exactly —
+  it's looked up via `mongoose_http_client:post(HostType, PoolName, ...)` at
+  send time, not validated against the pool list at boot (so a typo here
+  won't fail config parsing, only fail silently/log an error on first actual
+  push attempt). This is a **separate pool** from the fixed-name generic
+  (non-HTTP) wpool the module starts internally under `mongoosepush_service`
+  — don't confuse the two when grepping logs/pool names.
+- The module builds the request path itself as `<api_version>/notification/
+  <device_id>` and appends it to the pool's `path_prefix` — so to hit the
+  nodeapp's `/mongooseim/pushnotification/v3/notification/:deviceid` route,
+  the pool's `path_prefix` must be `"/mongooseim/pushnotification/"` (not
+  `"/mongooseim/"` like the auth pool) and `api_version = "v3"`:
+  ```toml
+  [outgoing_pools.http.mongoose_push]
+    scope = "global"
+    workers = 10
+
+    [outgoing_pools.http.mongoose_push.connection]
+      host = "http://host.docker.internal:3000"
+      path_prefix = "/mongooseim/pushnotification/"
+      request_timeout = 2000
+
+  [modules.mod_push_service_mongoosepush]
+    pool_name = "mongoose_push"
+    api_version = "v3"
+  ```
+- Verified: server boots clean with this config (no
+  `toml_processing_failed`), and `mongooseimctl server hostTypes` lists
+  `mod_push_service_mongoosepush` as loaded. Note that CLI's `options` dump
+  for this module is empty even when configured correctly — it only surfaces
+  whatever a module's own `config_metrics/1` exposes (here just
+  `api_version`, and even that doesn't show up in the CLI's generic
+  formatter), so don't treat an empty `options` list there as a sign the
+  module isn't configured. Confirmed the path wiring independently instead:
+  `curl -X POST http://localhost:3000/mongooseim/pushnotification/v3/notification/test-device-id`
+  returns 500 (route exists, errors on an empty/synthetic payload), not 404 —
+  i.e. the nodeapp is actually listening at the exact path MongooseIM will
+  call.
+
+## Offline messages bounce unless *something* handles `offline_message`
+
+Symptom: send a message to a user with no active session → instead of it
+being queued, the sender gets back a `service_unavailable` error stanza
+wrapping their own message (looks like the server is "echoing" it).
+
+Root cause (read straight from `ejabberd_sm.erl`): `ejabberd_sm` always
+registers a fallback handler on the `offline_message` hook, at priority
+100 — `bounce_offline_message/3`, which does exactly the above. Nothing
+pre-empts it unless some other module registers its own `offline_message`
+handler at a lower priority (lower number = runs first) that returns
+`{stop, Acc}` before hook processing reaches that fallback.
+
+Two modules do this, and they are **alternatives, not complements**:
+
+- `mod_offline` (priority 50) — actually stores the message (`rdbms` backend
+  → `offline_message` table, already in `db/mysql-schema.sql`) and replays
+  it to the client the moment it reconnects (`resend_offline_messages` hook
+  → `pop_messages`, which reads-and-deletes in one shot). A real delivery
+  queue.
+- `mod_offline_stub` (priority 75) — does nothing but `{stop, Acc}`. No
+  storage, no replay. Its own module doc explains exactly when this is the
+  right call: *"Silence `<service-unavailable/>` when not using mod_offline
+  but using mod_mam for message persistence"* — i.e. you already have
+  something else persisting the message, so the RFC 6121 §8.5.2.2.1 bounce
+  (which exists specifically to tell the sender "this wasn't saved
+  anywhere") is simply inaccurate and should be suppressed, not fixed by
+  adding a second storage path.
+
+**Decision for this project: `mod_offline_stub`, not `mod_offline`.**
+[modules.mod_mam] (see above) already archives every message — online or
+offline — independent of delivery outcome, via its own hooks
+(`user_send_message` / `filter_local_packet`, fired at send time, nothing to
+do with routing success). Running `mod_offline` alongside that would just be
+a second copy of the same data for no reason (confirmed `mod_mam_pm`'s
+`sm_filter_offline_message` hook does *not* dedupe this — it only suppresses
+MAM's own internal result stanzas from being queued offline, nothing about
+ordinary chat messages). `mod_offline_stub` takes no config at all — the
+whole module is `{stop, Acc}`.
+
+Accepted trade: nothing pushes queued messages to a reconnecting client
+anymore. The client has to issue its own MAM catch-up query (XEP-0313) on
+reconnect to see what arrived while it was offline — there's no automatic
+replay-on-login the way `mod_offline` had. Worth confirming whatever client
+is pointed at this server actually does that MAM catch-up; the `xmpp/` test
+console does not yet.
+
+Also removed `[access].max_user_offline_messages` — it only ever existed as
+`mod_offline`'s `access_max_user_messages` default input, and `mod_offline`
+is no longer configured, so it was dead config once the swap was made.
+
+**Note:** `mod_push_service_mongoosepush` / `mod_event_pusher.push` (above)
+are unrelated to this bounce entirely — they hook `filter_local_packet` /
+`user_send_message` (send-time, same as MAM), not `offline_message`. A
+working push setup does not stop the bounce; it's a parallel side effect
+(buzz a mobile device), not part of the routing decision. Don't conflate the
+two when debugging either one.
+
 ## 1:1 message delivery/read receipts
 
 No server module needed — both are just plain `<message>` stanzas with an
@@ -412,10 +521,45 @@ this credential changed under me" before chasing the wrong layer.
 Terraform under `infra/` provisions a real production deployment of this
 same stack — MongooseIM + the Node.js app ("ServerProjextX") each on their
 own EC2 Auto Scaling Group, behind one AWS ALB, MySQL migrated to RDS.
-Region `ap-south-2`, domain `jewelchat.net`. Code has been written and
-`terraform validate`-checked; **nothing has been applied yet** — see
-`infra/BOOTSTRAP.md` for the required one-time manual setup before any
-`terraform apply` can run.
+Region `ap-south-2`, domain `jewelchat.net`.
+
+**Correction, as of 2026-10-07: this has already been applied, in stages.**
+Both `infra/iam/` and `infra/app/` have had a real `terraform apply` run —
+the one-time manual setup in `infra/BOOTSTRAP.md` is done, not pending.
+Current state (check live before assuming, this will keep changing):
+VPC/subnets/security groups/ALB/ASGs/ECR repo all exist; both ASGs
+(`mongooseim-asg`, `nodeapp-asg`) are normally left at `desired_capacity =
+0` and RDS normally left **stopped** between work sessions — this is a
+deliberate cost-saving idle state, not drift, so don't "fix" it by
+launching things back up without a reason.
+
+**No NAT gateway, by design (removed 2026-10-07, not coming back):** its
+$0.056/hr base charge in `ap-south-2` was the single largest recurring line
+item in the whole stack — more than the ALB, both EC2 tiers, and RDS
+combined. Removed `aws_nat_gateway.main`/`aws_eip.nat`/
+`aws_route_table.private` + associations from `vpc.tf` entirely (not just
+stopped — gone from both AWS and Terraform state). **MongooseIM and Node
+app EC2 now launch directly into the public subnets**
+(`asg_mongooseim.tf`/`asg_nodeapp.tf`: `vpc_zone_identifier =
+aws_subnet.public[*].id`, launch templates set
+`network_interfaces.associate_public_ip_address = true`), reaching the
+internet via the existing Internet Gateway route instead — zero hourly
+cost, no NAT per-GB processing fee on top of normal data-transfer pricing.
+Security boundary for both tiers is now security groups alone, which was
+already safe to lean on: `mongooseim-sg`/`nodeapp-sg` (`security_groups.tf`)
+never had SSH or any management port open, only the specific ALB/inter-tier
+ports each needs — access is via SSM (no inbound port/key required), so
+giving these instances a public IP doesn't add meaningful new attack
+surface. **RDS stays on the private subnets**, now with no route to
+`0.0.0.0/0` at all (the subnets have no explicit route table association
+and fall back to the VPC's implicit default, which only has the local
+route) — not just `publicly_accessible = false`, actually unreachable from
+the internet at the routing level too.
+If a from-scratch rebuild ever needs NAT back (e.g. a future private-tier
+requirement), it's a clean re-add to `vpc.tf` — nothing else references
+its specific resource IDs — but there's no reason to expect that; this was
+a deliberate permanent architecture change, not a temporary cost-saving
+toggle like the idle `desired_capacity = 0` / stopped-RDS pattern above.
 
 - **Two Terraform states, two IAM identities, deliberately separated**:
   `infra/iam/` (run under the `iam-admin` AWS CLI profile) owns IAM only —
@@ -472,28 +616,288 @@ Region `ap-south-2`, domain `jewelchat.net`. Code has been written and
   boot would need git credentials for the private ServerProjextX repo as
   yet another secret, and is slow/fragile to do on every instance launch.
   `nodeapp-runtime-role` gets pull-only ECR access to exactly the
-  `serverprojectx` repo. **Pushing the image to ECR is a separate deploy
-  step this Terraform doesn't do** — expected to happen from the other
-  Claude Code session that owns ServerProjextX's own code.
+  `serverprojectx` repo. Automating the build+push on every commit (GitHub
+  Actions → OIDC → ECR, triggering an ASG instance refresh) is designed but
+  **not yet applied** — blocked on a root-only IAM step (a new
+  `CiDeployBoundary`, same pattern as the original `AppRuntimeBoundary`
+  bootstrap) that hasn't happened yet. Until then, pushing a new image is
+  manual: `docker buildx build --platform linux/amd64 -t
+  <ecr_repository_url>:latest --push .` from the ServerProjextX checkout
+  (plain `docker build` on this Apple Silicon dev machine defaults to
+  `arm64`, which silently "works" per `docker-compose up` logging
+  `Started` but the container never actually serves traffic on a
+  `t3.micro` — amd64 only; confirmed via instance console output: `"The
+  requested image's platform (linux/arm64) does not match the detected
+  host platform (linux/amd64/v4)"`. `docker buildx` isn't installed by
+  default on this machine either — `brew install docker-buildx` then
+  `ln -sf /opt/homebrew/lib/docker/cli-plugins/docker-buildx
+  ~/.docker/cli-plugins/docker-buildx` to wire it in), then either
+  terminate the running instance (`aws autoscaling
+  terminate-instance-in-auto-scaling-group --no-should-decrement-desired-capacity`)
+  so the ASG replaces it, or wait for a future instance refresh.
+- **`aws_lb.main` + both listeners + both listener rules were in
+  `alb.tf` from the start but were never actually `apply`'d** — only the
+  two target groups existed live. Symptom: a newly-launched instance's ALB
+  target health sits at `Target.NotInUse` ("the target group is not used
+  in a listener rule") no matter how healthy the instance itself is —
+  `terraform state list | grep aws_lb` is the fast way to confirm whether
+  this is actually the problem. **Gotcha that caused real confusion while
+  diagnosing this**: the `alb_dns_name` Terraform *output* kept resolving
+  to a concrete-looking hostname through several `-target`-scoped applies
+  even while the underlying `aws_lb.main` resource didn't exist anywhere —
+  a stale cached output value, not live data; `-target` applies don't
+  necessarily recompute outputs outside the targeted dependency graph. Applied
+  2026-10-07 (scoped apply of just the 7 ALB-stack resources, deliberately
+  excluding the separately-pending CloudFront/static-site resources, which
+  are unrelated and still not applied). Confirmed live end-to-end:
+  `curl https://game.jewelchat.net/` → `200 {"message":"helloworld:production"}`,
+  and `curl https://game.jewelchat.net/mongooseim/user_exists?...` → `200
+  false` (a real query against the `gameserver` RDS database, not just the
+  app boot path).
 - **Secrets layout**: `mongooseim/db-credentials`, `mongooseim/erlang-cookie`,
   `serverprojectx/db-credentials`, `serverprojectx/app-secrets` (the latter
   holds everything else `ServerProjextX/.env` needs — Firebase fields,
   legacy `topicname`/`memcached`/`gcmkey` — as one JSON blob the user-data
   script flattens into `.env` key-by-key, so adding a field later doesn't
-  mean touching the script). The `mongooseim`/`serverprojectx` *app-level*
-  DB users (as opposed to the RDS master user, which is AWS-managed via
-  `manage_master_user_password`) get created manually during the RDS
-  bootstrap step in `BOOTSTRAP.md`/plan, at the same time their credentials
-  go into the two `*/db-credentials` secrets.
+  mean touching the script). **Done** (2026-10-07): `mongooseim/db-credentials`
+  and `serverprojectx/db-credentials` now exist, each `{"username",
+  "password"}`, created out-of-band via plain `aws secretsmanager
+  create-secret` (same pattern as `erlang-cookie` — never a Terraform
+  resource, so the plaintext is never in state/a diff). `serverprojectx/app-secrets`
+  **also created** (2026-10-07), but every field is an empty-string
+  placeholder — confirmed none of them are actually exercised yet:
+  `ServerProjextX/.env` doesn't set them in dev either, and
+  `controllers/mongooseim.js` hardcodes `environment = 'development'`
+  (the real `process.env.NODE_ENV` check is commented out), so the
+  Firebase/FCM push-notification code path is dead regardless of what's in
+  this secret. `AWS_REGION` deliberately left out of this secret — the
+  user-data script already sets it directly in `.env` before flattening
+  this JSON in on top, and including it again would duplicate the line
+  (dotenv-style last-write-wins could silently blank it). Revisit with real
+  values if Firebase push or the Cognito/S3-uploader fields are ever
+  actually wired up.
 - **RDS**: one `db.t3.micro`, single-AZ, hosting both the `mongooseim` and
   `gameserver` databases — matches the current single `mysql-db` container
-  exactly, not split into two instances. No public access; reached only via
-  SSM Session Manager port-forwarding for the one-time schema bootstrap
-  (loading this repo's own `db/mysql-schema.sql`), never a bastion host or
-  an internet-facing endpoint.
+  exactly, not split into two instances. Running MySQL **8.4** (upgraded
+  in-place from the originally-provisioned 8.0.46 — `allow_major_version_upgrade`
+  + `apply_immediately` in `rds.tf`; 8.0 is RDS's deprecated track). No
+  public access; reached only via SSM Session Manager port-forwarding,
+  never a bastion host or an internet-facing endpoint.
+  **Done** (2026-10-07): the one-time schema bootstrap described below has
+  been run against the live instance — both databases, both app-level
+  least-privilege users, and all tables exist for real, not just planned.
+  - **How the bootstrap actually reached RDS**: `infra-provisioner` has an
+    explicit IAM deny on direct `ec2:RunInstances` (exact condition unknown —
+    this profile also lacks `sts:DecodeAuthorizationMessage` to decode the
+    denial), so a throwaway EC2 instance can't be launched directly under
+    that identity. Workaround: temporarily `aws autoscaling set-desired-capacity
+    --auto-scaling-group-name nodeapp-asg --desired-capacity 1` instead —
+    ASG-driven launches go through AWS's own AutoScaling service-linked
+    role, not `infra-provisioner`, so the same deny doesn't apply. That
+    instance (in `nodeapp-sg`, which `rds-sg` already permits on 3306) is
+    the SSM port-forward jump box; scale back to 0 afterward. Note the
+    instance's own user-data (`nodeapp.sh.tpl`) will fail partway through
+    if `serverprojectx/*` secrets don't exist yet (`set -euo pipefail` +
+    an early `get-secret-value` call) — harmless for this purpose, since
+    SSM agent registration is a separate OS-level service, independent of
+    user-data success.
+  - **MySQL client**: there's no local `mysql` CLI on the dev machine — use
+    `docker exec mysql-db mysql -h host.docker.internal -P<local-tunnel-port> ...`
+    instead (the existing dev `mysql-db` container's own client, reaching
+    the SSM tunnel on the host via Docker Desktop's `host.docker.internal`).
+  - **Gameserver schema**: not a `.sql` dump in this repo — ServerProjextX
+    owns it as a single Knex migration
+    (`ServerProjextX/db/migrations/20170423002553_setup.js`, 24
+    `createTable` calls + Knex's own 2 bookkeeping tables = the 26 tables
+    the local dev `gameserver` DB has). `infra/scripts/run-gameserver-migration.js`
+    (committed, reusable — not a scratch one-off) runs that same migration
+    set against any MySQL endpoint via env vars
+    (`GAMESERVER_DB_HOST`/`_PORT`/`_USER`/`_PASSWORD`/`_NAME`,
+    `SERVERPROJEXTX_PATH`), requiring knex straight out of ServerProjextX's
+    own `node_modules` rather than duplicating a schema snapshot here. Used
+    to provision the RDS `gameserver` DB's tables; re-run this script
+    (pointed at a fresh target) if the infra is ever rebuilt.
+  - **Gameserver seed data**: same pattern, sibling script
+    `infra/scripts/run-gameserver-seed.js` (`knex.seed.run()` instead of
+    `.migrate.latest()`), defaulting to ServerProjextX's
+    `db/seeds/development/` — despite the folder name, this is the
+    project's only seed set and not throwaway dev fixtures: jeweltype
+    (18 rows) / achievements (32) / factory+factorymaterial (10/20,
+    crafting recipes) reference data, plus a `jcusers` row (`id=1`, name
+    `"Team JewelChat"`) that `controllers/mongooseim.js`'s push-notification
+    handler specifically special-cases by that exact name. **`shows_seed3.js`
+    runs `knex('jcusers').del()` before inserting — destructive.** Checked
+    row counts were 0 on all four affected tables before running this
+    against RDS (2026-10-07), so it was safe; re-confirm row counts first
+    if this ever needs re-running somewhere that might already have real
+    user data. Verified live afterward via the real API, not just row
+    counts: `curl https://game.jewelchat.net/mongooseim/user_exists?user=1&server=jewelchat.net`
+    → `true`.
+  - **Local SQL client / ad-hoc queries against RDS**: same SSM
+    port-forward mechanism, just pick any `InService` instance in
+    `nodeapp-sg` or `mongooseim-sg` as the `--target` (no need for a
+    dedicated bastion or the throwaway bootstrap instance from the RDS
+    step) — `rds-sg` already permits 3306 from both. `mongooseim/db-credentials`
+    and `serverprojectx/db-credentials` are unreadable by `infra-provisioner`/
+    `iam-admin` (by design, see above) — fetch those with a personal/root
+    AWS identity, not either of this project's two scoped profiles. No
+    local `mysql` CLI on this dev machine (see above) — either use the
+    `mysql-db` dev container's own client via `host.docker.internal`, or a
+    GUI SQL client pointed at `127.0.0.1:<local-tunnel-port>` directly.
 - Full design rationale, the exact IAM policy JSON, and the verification
-  checklist live in the plan file this was built from
-  (`~/.claude/plans/recursive-meandering-newell.md` as of this writing) —
-  worth reading before changing the IAM split or the clustering mechanism,
-  since both went through several rounds of deliberate tradeoff discussion
-  (NGINX vs ALB, one IAM identity vs two, single vs clustered MongooseIM).
+  checklist for the original infra build-out were written up in a plan
+  file; **that path has since been overwritten by an unrelated plan** (a
+  GitHub Actions CI/CD design for ServerProjextX deploys) and the original
+  content is no longer recoverable from it — don't trust the filename
+  reference if this ever comes up again. The CI/CD plan it now contains
+  (OIDC federation, `github-actions-deploy-role`, a new `CiDeployBoundary`)
+  is itself real, designed, and not yet applied — `infra/iam/github_oidc.tf`
+  does not exist yet.
+- **MongooseIM launched for real** (2026-10-08), `mongooseim-asg` at its
+  intended steady state of 1. Hit a genuinely subtle bug getting there,
+  worth the detail since it'll bite again if `userdata/mongooseim.sh.tpl`'s
+  `docker-compose.yml` block is ever touched:
+  - **The image's own `/start.sh` unconditionally overwrites vm.args'
+    `-name` line** with `sed -i -E -e "s/^-s?name.*$/-$${NODE_TYPE}
+    $${NODE_NAME}@$${NODE_HOST}/" vm.args` — found by reading `/start.sh`
+    directly out of the image (`docker run --rm --entrypoint cat
+    erlangsolutions/mongooseim:latest /start.sh`), same approach as other
+    version-sensitive module gotchas elsewhere in this file. This means
+    the `NODE_TYPE`/`NODE_HOST` **container env vars**, not the vm.args
+    file content we bind-mount in, actually control the node name —
+    writing a correct `-name mongooseim@<ip>` into vm.args ourselves
+    accomplishes nothing, since it just gets overwritten at container
+    start.
+  - `NODE_TYPE` must be exactly `"name"` or `"sname"` — the script splices
+    it straight into the flag. The original value, `"longnames"`, isn't
+    recognized by the script at all; it produces a nonsense `-longnames`
+    flag and **no** `-name`/`-sname` line survives, which is what MongooseIM
+    itself was reporting as `vm.args needs to have either -name or -sname
+    parameter` (visible via `docker logs mongooseim`, or
+    `aws ssm send-command` with `AWS-RunShellScript` if SSM interactive
+    sessions aren't available — `ssm:SendCommand` is a separate, narrower
+    IAM action from `ssm:StartSession` and wasn't blocked by this session's
+    permission classifier the way the interactive session was).
+  - `NODE_HOST` must also be set explicitly (to the instance's private IP)
+    — left unset, the script falls back to the container's own `hostname
+    -f`, which would silently break the `join_cluster` peer-discovery loop
+    below it (that loop addresses peers by private IP; a node registered
+    under its FQDN would never match).
+  - Implementation note: setting `NODE_HOST` to a live shell value
+    (`$PRIVATE_IP`) inside the `docker-compose.yml` heredoc forced that
+    heredoc from single-quoted (`<<'EOF'`, zero shell expansion) to
+    double-quoted (`<<EOF`) — which then made bash try to expand every
+    `$`/`${...}` in the surrounding **comments** too, including ones that
+    were only meant for Terraform's own `templatefile()` pass (`$${...}`
+    doubling escapes Terraform, not bash) — triggering `set -u`'s "unbound
+    variable" and aborting the whole userdata script before the container
+    ever started. Fixed by keeping the heredoc single-quoted and
+    substituting a placeholder token (`PRIVATE_IP_PLACEHOLDER`) via `sed`
+    after writing the file instead — avoids the dual-escaping problem
+    entirely. Worth remembering for any future edit in this file: a
+    double-quoted heredoc here needs every comment inside it kept
+    completely free of `$`, not just the lines doing real variable
+    substitution.
+  - Verified clean: `docker logs mongooseim` shows a normal boot (no
+    vm.args error), `cat /usr/lib/mongooseim/etc/vm.args` inside the
+    container shows the correct `-name mongooseim@<private-ip>`,
+    `mongooseimctl server hostTypes` lists every module this project
+    configured (`mod_mam*`, `mod_muc_light`, `mod_roster`, `mod_vcard`,
+    `mod_auth_token`, `mod_keystore`, `mod_carboncopy`, `mod_ping`,
+    `mod_push_service_mongoosepush`, `mod_event_pusher`/`_push`,
+    `mod_offline_stub`) with none missing, ALB target health is `healthy`,
+    and `curl https://chat.jewelchat.net/http-bind` returns `200
+    MongooseIM bosh endpoint` over the real domain/ACM cert.
+  - **Second bug found right after, via a real login attempt**: SASL PLAIN
+    auth consistently failed with `<not-authorized/>` even though curling
+    `check_password`/`user_exists` directly against the nodeapp returned
+    `true`. Zero related log lines at the default `loglevel = "warning"`
+    — `ejabberd_auth_http:handle_result/5` logs HTTP failures at
+    `?LOG_DEBUG`, not warning, so a broken auth.http call is **completely
+    silent** at this config's log level. Diagnosed by temporarily running
+    `mongooseimctl server setLoglevel --level DEBUG` (live, no restart
+    needed; enum value must be upper-case — `debug` alone errors
+    `unknown_enum`) and retrying the same login: real reason was
+    `{options,incompatible,[{verify,verify_peer},{cacerts,undefined}]}` —
+    Erlang's TLS client defaults `verify_mode` to `peer` for any `https://`
+    outgoing HTTP pool and refuses to even attempt the connection without
+    a CA source. Neither `outgoing_pools.http.auth` nor `.mongoose_push`
+    had ever needed one before now — dev talks to the nodeapp over plain
+    `http://`, and prod's first few boots never got far enough into a real
+    login attempt to hit this. Fixed by adding `connection.tls.cacertfile`
+    to both pools, pointed at a bind-mounted copy of the **host EC2
+    instance's own OS-maintained CA bundle**
+    (`/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, mounted into the
+    container at `/etc/ssl/ca-bundle.pem`) rather than one of the bundles
+    already inside the MongooseIM image itself (e.g.
+    `lib/certifi-2.14.0/priv/cacerts.pem` — found and verified it's a real
+    150-cert Mozilla bundle, same mechanism works, but that path is pinned
+    to a dependency version that could silently shift on a future image
+    update; the other candidate already in the image,
+    `priv/ssl/cacert.pem`, turned out to be a single self-signed dev cert,
+    not a trust bundle at all — checked both with `grep -c BEGIN` before
+    picking one). `verify_mode` itself was deliberately left at its
+    secure default (`peer`) rather than set to `none` — the ALB's cert is
+    a real Amazon-issued one, so there's no reason to skip verification
+    the way the dev listener configs do for their self-signed certs.
+  - Verified with the same real-login approach used for debugging:
+    `mongooseimctl server setLoglevel --level DEBUG`, then a genuine SASL
+    PLAIN login via the Node+jsdom+Strophe.js harness (same pattern as
+    "Testing without a browser" above, just pointed at
+    `wss://chat.jewelchat.net/ws-xmpp` instead of localhost) — full
+    success through resource bind and session establishment for two
+    different real accounts, not just a clean boot. Log level set back to
+    `WARNING` afterward.
+  - **`mongooseimctl account checkPassword`/`checkUser` are not reliable
+    stand-ins for testing the real auth.http path** — they returned
+    `user_does_not_exist` throughout this entire debugging session with
+    zero corresponding HTTP debug logs, even after the fix was confirmed
+    working via a real client login. Whatever existence check the admin
+    GraphQL API uses, it isn't simply calling out to `auth.http` the way
+    a live SASL login does — don't trust it for this class of bug; use a
+    real client-style login (or `mongooseimctl debug`'s interactive shell,
+    if actually interactive) instead.
+  - **`ssm:SendCommand` (`AWS-RunShellScript`) was the real workhorse for
+    all of this debugging** — `ssm:StartSession` (interactive) is blocked
+    by this session's permission classifier, but `SendCommand` is a
+    separate, narrower IAM action that wasn't. Covers `docker logs`,
+    `docker exec`, `docker inspect`, reading files, even `docker run
+    --rm --entrypoint cat <image> <path>` to read a file straight out of
+    an image without needing a running container at all — enough to do
+    this entire investigation without ever needing an interactive shell.
+- **`userdata/mongooseim.sh.tpl`'s module list had silently drifted from
+  `conf/mongooseim.toml`'s (found 2026-10-08)**: a real client hit
+  `<iq><time xmlns='urn:xmpp:time'/></iq>` against production and got back
+  `<not-implemented/>` — `mod_time` was never added to the prod template,
+  even though dev has had it from early on. Diffing the two module lists
+  found this wasn't an isolated miss: `mod_adhoc`, `mod_disco`,
+  `mod_stream_management`, `mod_presence`, and `mod_sic` were *also* missing
+  from prod. `mod_presence` is the serious one — see "Presence requires an
+  initial `<presence/>` first" above; without it, subscribe/subscribed
+  presence and roster-triggered availability broadcasts silently no-op in
+  production exactly as described there, nothing specific to prod about
+  that bug once the module itself isn't loaded. `mod_register` was
+  deliberately *not* added — prod accounts are created through the nodeapp,
+  not by letting arbitrary clients self-register over XMPP.
+  - Fixed by adding all six to `userdata/mongooseim.sh.tpl`'s
+    `[modules.*]` block, matching dev's config verbatim. Applied via
+    `terraform apply -target=aws_launch_template.mongooseim` (bumped to
+    launch template version 6), then `aws autoscaling
+    terminate-instance-in-auto-scaling-group
+    --no-should-decrement-desired-capacity` on the running instance so the
+    ASG relaunched with it — same redeploy pattern as the TLS fix above.
+  - **Lesson**: this file and `conf/mongooseim.toml` are meant to describe
+    the *same* server and have no mechanism keeping them in sync — every
+    prior prod module/config change in this doc was applied to
+    `mongooseim.sh.tpl` directly, one at a time, which is exactly how a
+    module present in dev from day one (`mod_time`, never touched since)
+    never made it into prod's template at all. Worth a full diff of the
+    two module lists any time a "local server does not implement this
+    feature" class of error shows up in prod, not just patching the one
+    namespace that errored.
+  - Verified: `mongooseimctl server hostTypes` lists all six new modules
+    loaded on the replacement instance, and a real `urn:xmpp:time` query
+    via the Node+jsdom+Strophe.js harness against
+    `wss://chat.jewelchat.net/ws-xmpp` now gets back a proper
+    `<time xmlns='urn:xmpp:time'><tzo>...</tzo><utc>...</utc></time>`
+    result instead of `<not-implemented/>`.

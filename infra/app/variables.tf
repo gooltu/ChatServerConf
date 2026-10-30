@@ -90,3 +90,11 @@ variable "mongooseim_max_capacity" {
   type    = number
   default = 5
 }
+
+# Intended steady state is 1 (see asg_mongooseim.tf) — override to 0 to
+# deliberately idle this ASG (e.g. between infra changes) without touching
+# that file.
+variable "mongooseim_desired_capacity" {
+  type    = number
+  default = 1
+}

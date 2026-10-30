@@ -15,10 +15,23 @@ resource "aws_db_subnet_group" "main" {
 # `mongooseim/db-credentials` and `serverprojectx/db-credentials` Secrets
 # Manager secrets that the two runtime roles read at boot.
 resource "aws_db_instance" "main" {
-  identifier     = "jewelchat-prod"
-  engine         = "mysql"
-  engine_version = "8.0"
-  instance_class = var.rds_instance_class
+  identifier = "jewelchat-prod"
+  engine     = "mysql"
+  # 8.0 is RDS's deprecated track (support window closing); 8.4 is the
+  # current LTS release — confirmed via `aws rds describe-db-engine-versions
+  # --engine mysql --region ap-south-2` (profile infra-provisioner), which
+  # lists 8.4.5 through 8.4.11 as available alongside the 8.0.x/5.7.x tracks.
+  # Two-part version (not a pinned 8.4.11) matches how "8.0" was specified
+  # before — auto_minor_version_upgrade (provider default: true) tracks the
+  # latest minor within whichever major.minor family is set here.
+  engine_version = "8.4"
+  # Required by the provider to perform the 8.0.46 -> 8.4.x major-version
+  # upgrade on the already-created live instance. apply_immediately so this
+  # runs now instead of waiting for the next maintenance window — safe at
+  # this point since the instance has no databases/traffic on it yet.
+  allow_major_version_upgrade = true
+  apply_immediately           = true
+  instance_class              = var.rds_instance_class
 
   allocated_storage = 20
   storage_type      = "gp3"

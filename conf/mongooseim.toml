@@ -114,6 +114,24 @@
     path_prefix = "/mongooseim/"
     request_timeout = 2000
 
+# HTTP pool mod_push_service_mongoosepush posts outgoing push notifications
+# through. Points at the same nodeapp backend as the auth pool above (same
+# host.docker.internal:3000 bridging), but with its own path_prefix — the
+# module appends "<api_version>/notification/<device_id>" to whatever prefix
+# is set here, so "/mongooseim/pushnotification/" + "v3/notification/<id>"
+# gives the full "/mongooseim/pushnotification/v3/notification/:deviceid"
+# endpoint. This pool name ("mongoose_push") is distinct from the generic
+# (non-HTTP) wpool the module starts internally under the fixed name
+# "mongoosepush_service" — don't confuse the two.
+[outgoing_pools.http.mongoose_push]
+  scope = "global"
+  workers = 10
+
+  [outgoing_pools.http.mongoose_push.connection]
+    host = "http://host.docker.internal:3000"
+    path_prefix = "/mongooseim/pushnotification/"
+    request_timeout = 2000
+
 [services.service_bosh]
 
 [services.service_mongoose_system_metrics]
@@ -133,6 +151,27 @@
   access = "register"
 
 [modules.mod_presence]
+
+# Without any handler on the `offline_message` hook, a chat message to an
+# offline user bounces: ejabberd_sm always registers a fallback handler
+# (priority 100) that replies to the sender with a service-unavailable error
+# wrapping the original stanza (ejabberd_sm:bounce_offline_message/3) — the
+# "server echoes my own message back to me" symptom.
+#
+# Deliberately using mod_offline_stub here instead of mod_offline: mod_mam
+# (below) already persists every message - online or offline - independent
+# of delivery outcome, so a real offline-message queue would just be a second
+# copy of the same data for no reason. mod_offline_stub's hooks/1 registers
+# exactly one handler, on `offline_message` at priority 75 (still ahead of
+# ejabberd_sm's 100), whose entire body is `{stop, Acc}` — it does no storage
+# of its own, it only exists to stop the hook chain before the bounce
+# fallback fires, since RFC 6121 §8.5.2.2.1 only requires that bounce when the
+# message truly wasn't persisted anywhere, which isn't true here thanks to
+# MAM. Recipients get messages sent while they were offline via a MAM
+# catch-up query on reconnect, not pushed automatically the way mod_offline's
+# pop-on-login would have — that's an accepted trade for not maintaining a
+# second storage path.
+[modules.mod_offline_stub]
 
 # Roster (contact list) management — handles jabber:iq:roster IQs (add/
 # remove/query contacts, subscription state). backend = "rdbms" matches the
@@ -210,6 +249,53 @@
   backend = "rdbms"
   allow_multiple_owners = true
 
+# Adapter that knows how to call out to a MongoosePush-shaped push gateway —
+# here, the nodeapp backend's /mongooseim/pushnotification/ route (see the
+# outgoing_pools.http.mongoose_push pool above for the actual host/path).
+# pool_name must match that pool's name exactly; api_version is appended into
+# the request path by the module itself ("v3/notification/<device_id>").
+# This module only knows how to *send* a push once asked — mod_event_pusher's
+# "push" backend below (XEP-0357) is what actually decides when to ask it.
+[modules.mod_push_service_mongoosepush]
+  pool_name = "mongoose_push"
+  api_version = "v3"
+
+# XEP-0357 (Push Notifications): lets a client register ("enable") a device
+# for push while it's connected, so offline-message delivery can trigger an
+# actual push instead of silently queuing. backend = "rdbms" matches the
+# event_pusher_push_subscription table already loaded into MySQL (stores
+# owner_jid/node/pubsub_jid/form per registration), instead of the module's
+# mnesia default.
+#
+# virtual_pubsub_hosts is the key wiring piece: a real XEP-0357 client enables
+# push against a PubSub *service* JID (`<enable jid='<pubsub-jid>' .../>`).
+# Since there's no real PubSub server running here, that service JID must
+# match one of these subdomain templates — only then does MongooseIM treat it
+# as "virtual" and route straight to mod_push_service_mongoosepush's hook
+# instead of trying to deliver a real pubsub#publish IQ over the wire (which
+# would go nowhere and just time out). Dedicated subdomain picked to match
+# this project's existing convention (vjud.@HOST@, muclight.@HOST@) rather
+# than overloading the bare domain.
+#
+# Client-side contract for this to actually fire a push (not yet exercised
+# against this server — see CLAUDE.md "mod_event_pusher / push" notes):
+#   <iq type='set'>
+#     <enable xmlns='urn:xmpp:push:0' jid='pubsub.jewelchat.net' node='<any-id>'>
+#       <x xmlns='jabber:x:data' type='submit'>
+#         <field var='FORM_TYPE'><value>http://jabber.org/protocol/pubsub#publish-options</value></field>
+#         <field var='device_id'><value>DEVICE_TOKEN</value></field>
+#         <field var='service'><value>fcm</value></field>
+#       </x>
+#     </enable>
+#   </iq>
+# `device_id` and `service` are read out of that publish-options form by
+# mod_push_service_mongoosepush (not from `node`, which is just XEP-0357's
+# opaque registration key) — both fields are required or the push silently
+# no-ops (service) or crashes the request handler (missing device_id).
+[modules.mod_event_pusher.push]
+  backend = "rdbms"
+  virtual_pubsub_hosts = ["pubsub.@HOST@"]
+
 [instrumentation.prometheus]
 
 [instrumentation.log]
@@ -232,11 +318,6 @@
 [access]
   max_user_sessions = [
     {acl = "all", value = 10}
-  ]
-
-  max_user_offline_messages = [
-    {acl = "admin", value = 5000},
-    {acl = "all", value = 100}
   ]
 
   local = [

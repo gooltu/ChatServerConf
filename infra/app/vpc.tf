@@ -21,7 +21,12 @@ resource "aws_subnet" "public" {
   tags                    = { Name = "jewelchat-public-${var.availability_zones[count.index]}" }
 }
 
-# Private subnets — MongooseIM EC2, Node app EC2, RDS.
+# RDS only now (MongooseIM/Node app EC2 moved to the public subnets below —
+# see asg_mongooseim.tf/asg_nodeapp.tf). No route table association of its
+# own: falls back to the VPC's implicit default route table, which only
+# has the local 10.20.0.0/16 route — RDS has no need for a path out, and
+# this means it's unreachable from the internet at the routing level, not
+# just via publicly_accessible=false/security groups (defense in depth).
 resource "aws_subnet" "private" {
   count             = length(var.availability_zones)
   vpc_id            = aws_vpc.main.id
@@ -45,34 +50,16 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Single NAT Gateway (not one per AZ) — keeps cost down for "smallest for
-# now". Real recurring cost (hourly + per-GB processed) worth reconsidering
-# once traffic patterns are known; VPC endpoints for Secrets Manager/S3/
-# CloudWatch Logs would remove most of what currently needs it, though
-# general package/Docker-Hub egress still needs some path out.
-resource "aws_eip" "nat" {
-  domain = "vpc"
-  tags   = { Name = "jewelchat-nat" }
-}
-
-resource "aws_nat_gateway" "main" {
-  allocation_id = aws_eip.nat.id
-  subnet_id     = aws_subnet.public[0].id
-  tags          = { Name = "jewelchat-nat" }
-  depends_on    = [aws_internet_gateway.main]
-}
-
-resource "aws_route_table" "private" {
-  vpc_id = aws_vpc.main.id
-  route {
-    cidr_block     = "0.0.0.0/0"
-    nat_gateway_id = aws_nat_gateway.main.id
-  }
-  tags = { Name = "jewelchat-private" }
-}
-
-resource "aws_route_table_association" "private" {
-  count          = length(aws_subnet.private)
-  subnet_id      = aws_subnet.private[count.index].id
-  route_table_id = aws_route_table.private.id
-}
+# NAT Gateway deliberately removed (2026-10-07): its $0.056/hr base charge
+# alone was the single largest recurring line item in this whole stack —
+# more than the ALB, both EC2 instances, and RDS combined (see cost
+# breakdown discussion). MongooseIM/Node app EC2 moved to the public
+# subnets instead (asg_mongooseim.tf/asg_nodeapp.tf): a plain Internet
+# Gateway route costs nothing per-hour and nothing per-GB on top of normal
+# data-transfer-out pricing (NAT's per-GB "processing" fee was on top of
+# that, not instead of it). Security boundary is now security groups alone
+# — acceptable here because `mongooseim-sg`/`nodeapp-sg` (security_groups.tf)
+# were already minimal before this change: no SSH, no inbound management
+# ports, only the specific ALB/inter-tier ports they need. RDS stays on the
+# private subnets above with no internet route at all, regardless of this
+# change.

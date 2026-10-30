@@ -4,6 +4,15 @@ resource "aws_lb" "main" {
   load_balancer_type = "application"
   security_groups    = [aws_security_group.alb.id]
   subnets            = aws_subnet.public[*].id
+
+  # AWS default is 60s, independent of (and in front of) MongooseIM's own
+  # mongoose_websocket_handler.timeout (set to 600_000ms in
+  # userdata/mongooseim.sh.tpl) — the ALB closes the TCP connection itself
+  # on a 60s idle gap regardless of what MongooseIM is configured to
+  # tolerate, which is what was actually killing idle WebSocket sessions
+  # within a few minutes. Matched to MongooseIM's own timeout so neither
+  # layer is the tighter constraint.
+  idle_timeout = 600
 }
 
 # WebSocket/BOSH traffic. Stickiness matters for BOSH's multiple discrete
